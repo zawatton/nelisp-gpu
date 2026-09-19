@@ -1,0 +1,8 @@
+/host/vkcompute
+/host/vkmatmul
+/host/vksoftmax
+/host/vkrun
+kernels/*.spv
+*.elc
+*.eln
+*~

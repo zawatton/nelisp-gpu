@@ -1,0 +1,116 @@
+#+TITLE: nelisp-gpu — an elisp → SPIR-V → Vulkan GPU compute compiler
+#+AUTHOR: zawatton + Claude
+#+STATUS: early / feasibility spike (2026-06-27)
+
+* What this is
+
+A Triton / CUDA.jl / Halide-style system where compute *kernels are
+written in elisp* (an s-expression DSL) and an elisp compiler lowers
+them to *SPIR-V* — the open, vendor-neutral GPU IR — which the *Vulkan*
+driver runs on the GPU.  The target is open hardware acceleration with
+no NVIDIA-CUDA lock-in: SPIR-V/Vulkan run on NVIDIA, AMD and Intel.
+
+This is the GPU sibling of =nelisp-cc= (which lowers an elisp systems
+grammar to native *CPU* machine code).  Here the backend target is the
+GPU IR instead of x86_64/arm64.
+
+* The one hard fact
+
+elisp does *not* execute on GPU cores — no language's runtime does.
+GPUs run their own machine code (SASS/RDNA/Xe).  Like Triton (Python)
+and CUDA.jl (Julia), the kernel is *written* in the high-level language
+and *compiled* to GPU code.  So:
+
+- the kernel *source* is elisp (s-expr DSL),
+- the kernel *binary* is SPIR-V emitted by elisp,
+- the kernel *runs* as native GPU code under Vulkan.
+
+* Architecture
+
+#+begin_src text
+  elisp kernel DSL  (defkernel vadd (a b c n) ...)
+       │  [elisp compiler: DSL → SSA → SPIR-V words]      <- the IP
+       ▼
+  SPIR-V binary  (validated vs glslang reference / spirv-val)
+       │
+       ▼
+  Vulkan compute dispatch  (host)
+       │   reference host: host/vkcompute.c  (C, throwaway)
+       │   target host:    nelisp-cc extern-calls to libvulkan (elisp-authored)
+       ▼
+  GPU (e.g. GTX 1060 here, but any Vulkan GPU)
+#+end_src
+
+Everything except the GPU driver itself is meant to end up
+elisp/nelisp-authored (kernel compiler in elisp; host in nelisp-cc
+grammar → native, extern-calling only libvulkan).  No Rust, no CUDA, no
+hand-written C in the final run path.
+
+* Local hardware (verified 2026-06-27)
+
+- GPU: NVIDIA GeForce GTX 1060 6GB, Vulkan 1.3.277 (NVIDIA driver)
+- CPU: AMD Ryzen 9 5950X (16C/32T) for the CPU/native path
+- toolchain: gcc/g++, libvulkan-dev, vulkan headers present;
+  glslang-tools / spirv-tools installable via apt (needed for the
+  reference shader + validation oracle).
+
+* Phases
+
+** Phase 0 — de-risk the stack  [DONE 2026-06-27]
+- [X] reference Vulkan compute host =host/vkcompute.c=
+- [X] proved the GPU runs generated SPIR-V: a hand-assembled vadd module
+      (=tools/emit_vadd_ref.py=, no glslang/CUDA) ran on the GTX 1060 and
+      verified c = a + b.
+
+** Phase 1 — elisp emits SPIR-V (the thesis)  [DONE 2026-06-27]
+- [X] =lisp/nelisp-gpu-spirv.el= assembles the vadd SPIR-V module from
+      elisp; output is byte-identical to the reference emitter and runs
+      on the GTX 1060 (=make el-derisk=).  This proves the GPU kernel is
+      *written and compiled in elisp*.
+- TODO: add =spirv-val= / =spirv-dis= as a validation oracle
+  (=sudo apt-get install -y glslang-tools spirv-tools=); not required for
+  correctness (the GPU itself validates by behaviour) but useful as the
+  DSL compiler grows.
+
+** Phase 2 — kernel DSL + compiler  [matmul DONE 2026-06-27]
+- [X] =lisp/nelisp-gpu-compile.el=: s-expr kernel DSL → SPIR-V compiler
+      with auto id allocation, type/constant interning, int/float type
+      inference, buffer load/store, push constants, =gid-x=, =when=, and
+      memory-based =for= loops.
+- [X] =lisp/nelisp-gpu-kernels.el=: kernel registry (vadd, matmul).
+- [X] *matmul* compiled from the elisp DSL runs and verifies on the GTX
+      1060: ~61 GFLOP/s at 512^3 (=make matmul-derisk=), ~3600x the
+      pure-elisp CPU path (~17 Mflop/s).  Naive one-thread-per-output;
+      tiling/shared-memory will raise it further.
+- [X] *softmax* (row-wise) compiled from the DSL runs on the GTX 1060:
+      row sum 1.00000, max abs err ~1e-9 vs CPU.  Added =exp= via the
+      GLSL.std.450 extended instruction set and type-aware float
+      comparisons (FOrd*).  Float constants verified bit-exact vs IEEE-754.
+- [X] *gelu* and *layernorm* compiled from the DSL (added =sqrt= via
+      GLSL.std.450 and a uint->float cast).
+- [X] generic dispatcher =host/vkrun= (any buffer count / sizes / push)
+      + elisp driver =lisp/nelisp-gpu-run.el= + =test/verify.el=, which
+      checks every kernel against the *photon-tensor CPU oracle* — so new
+      kernels need no new C host.  =make verify= results (vs CPU):
+      matmul 2.6e-8, softmax 1.6e-8, gelu 5.2e-7, layernorm 3.9e-7 — all PASS.
+- The full transformer kernel set (matmul, softmax, gelu, layernorm)
+  now runs on the GPU from elisp.
+- TODO: tiled/shared-memory matmul for higher throughput; fused kernels.
+
+** Phase 3 — elisp-authored host
+- replace =vkcompute.c= with a host driven from elisp (nelisp-cc grammar
+  extern-calling libvulkan, or a thin module) so the whole path is
+  elisp-authored
+
+** Phase 4 — wire into nelisp-photon
+- expose GPU matmul/softmax as a =photon-tensor= backend so the
+  transformer (training and inference) can run on the GPU; size models
+  to GPU VRAM.
+
+* Build / run
+
+#+begin_src sh
+make tools-check          # what is installed
+make derisk N=4096        # build host + compile shader + run on GPU (needs glslang)
+make host && make run     # if you already have kernels/vadd.spv
+#+end_src

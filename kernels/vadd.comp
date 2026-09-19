@@ -1,0 +1,14 @@
+#version 450
+// Reference vector-add compute kernel (GLSL -> SPIR-V via glslang).
+// This is the GOLD reference: the elisp SPIR-V emitter must produce a
+// module with the same observable behaviour (c = a + b), validated by
+// running it through host/vkcompute and by diffing with spirv-dis.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly  buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
+layout(push_constant) uniform Push { uint n; };
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i < n) c[i] = a[i] + b[i];
+}
