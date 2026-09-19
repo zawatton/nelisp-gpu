@@ -665,21 +665,29 @@
 ;; The lane is extracted with integer division and remainder -- the DSL has no
 ;; shifts -- and sign-extended without a branch: (b + 128) % 256 - 128 maps
 ;; 0..127 to itself and 128..255 to -128..-1.
+;; SEQ gradients at once, laid out as SEQ x OUT in G and SEQ x COLS in X.  The
+;; weight is read once per thread either way, so a batch of positions costs one
+;; dispatch instead of SEQ of them -- which matters because the caller pays a
+;; round trip and an Elisp-side float encoding of G per call, not just a kernel.
+;; SEQ = 1 is exactly the old kernel.
 (push (cons 'dp4a-rows-t
-            '(:buffers (WP BETA G X) :push (out cols ng) :local-size 64
-              :body ((declare i :uint (gid-x))
-                     (when (< i cols)
+            '(:buffers (WP BETA G X) :push (out cols ng seq) :local-size 64
+              :body ((declare idx :uint (gid-x))
+                     (when (< idx (* seq cols))
+                       (declare p :uint (/ idx cols))
+                       (declare i :uint (% idx cols))
                        (declare word :uint (/ i 4))
                        (declare lane :uint (% i 4))
                        (declare sh :uint 1)
                        (for (l 0 lane) (set sh (* sh 256)))
+                       (declare gb :uint (* p out))
                        (declare acc :float 0.0)
                        (for (o 0 out)
                          (declare wpk :uint (bitcast-u (aref WP (+ (* o ng) word))))
                          (declare b :uint (% (/ wpk sh) 256))
                          (declare sv :float (- (float (% (+ b 128) 256)) 128.0))
-                         (set acc (+ acc (* sv (* (aref BETA o) (aref G o))))))
-                       (store (aref X i) acc)))))
+                         (set acc (+ acc (* sv (* (aref BETA o) (aref G (+ gb o)))))))
+                       (store (aref X idx) acc)))))
       nelisp-gpu-kernels)
 
 ;; --- BitNet b1.58 Phase B: packed ternary-weight matmul ---------------------
