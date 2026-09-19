@@ -652,6 +652,36 @@
                        (store (aref Y idx) (+ (aref BIAS o) (* (* (aref BETA o) (aref GAMMA s)) (float acc))))))))
       nelisp-gpu-kernels)
 
+;; The transpose of `bitlinear-dp4a-rows': X = W^T . (BETA * G), for a weight
+;; stored row-major with four int8 lanes per word and a scale per output row.
+;; This is the gradient of a linear with respect to its input, which a frozen
+;; quantized base still has to supply -- "frozen" means untrained, not unused.
+;;
+;; One thread per input column, which is the awkward direction: column i lives
+;; in word i/4, lane i%4 of every row, so each thread strides down the weight
+;; instead of along it.  DP4A does not apply, because BETA varies per row and
+;; multiplies each term, so the accumulation is float rather than int32.
+;;
+;; The lane is extracted with integer division and remainder -- the DSL has no
+;; shifts -- and sign-extended without a branch: (b + 128) % 256 - 128 maps
+;; 0..127 to itself and 128..255 to -128..-1.
+(push (cons 'dp4a-rows-t
+            '(:buffers (WP BETA G X) :push (out cols ng) :local-size 64
+              :body ((declare i :uint (gid-x))
+                     (when (< i cols)
+                       (declare word :uint (/ i 4))
+                       (declare lane :uint (% i 4))
+                       (declare sh :uint 1)
+                       (for (l 0 lane) (set sh (* sh 256)))
+                       (declare acc :float 0.0)
+                       (for (o 0 out)
+                         (declare wpk :uint (bitcast-u (aref WP (+ (* o ng) word))))
+                         (declare b :uint (% (/ wpk sh) 256))
+                         (declare sv :float (- (float (% (+ b 128) 256)) 128.0))
+                         (set acc (+ acc (* sv (* (aref BETA o) (aref G o))))))
+                       (store (aref X i) acc)))))
+      nelisp-gpu-kernels)
+
 ;; --- BitNet b1.58 Phase B: packed ternary-weight matmul ---------------------
 ;; Ternary weights are packed as base-4 codes (tern+1 in {0,1,2}), PK codes per
 ;; f32 (so the weight buffer is PK x smaller -- bandwidth/VRAM win on Pascal).

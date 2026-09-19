@@ -78,7 +78,7 @@
                              block-copy tree-attn qkv-append attn-stream-entries
                              absmean-acc quant-w quant-act bitlinear-packed bitlinear-packed-v
                              dp4a-dot bitlinear-dp4a bitlinear-dp4a-1f
-                             bitlinear-dp4a-rows
+                             bitlinear-dp4a-rows dp4a-rows-t
                              gather-spike scatter-spike
                              cache-append-paged decode-attn-paged)))
       (nelisp-gpu-write-kernel k (expand-file-name (format "%s.spv" k) dir)))
