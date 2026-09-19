@@ -272,6 +272,14 @@ disagreed by 7.7e+30 on a real one."
            (id (nelisp-gpu--newid)))
       (nelisp-gpu--emit 4450 (list (nelisp-gpu--type :int) id (car a) (car b) 1)) ; PackedVectorFormat4x8Bit
       (cons id :int)))
+   ((eq (car-safe e) 'bitcast-f)          ; reinterpret a uint32's bits as a float (OpBitcast)
+    ;; The inverse of `bitcast-u', and needed for the same reason: a buffer of
+    ;; packed integer lanes is declared float, so a kernel that *writes* packed
+    ;; words has to get them past the type.  Without this a kernel can unpack
+    ;; but not pack, which is exactly half of what is wanted.
+    (let* ((a (nelisp-gpu--lower (nth 1 e))) (id (nelisp-gpu--newid)))
+      (nelisp-gpu--emit 124 (list (nelisp-gpu--type :float) id (car a)))
+      (cons id :float)))
    ((eq (car-safe e) 'bitcast-u)          ; reinterpret a float's 32 bits as uint32 (OpBitcast)
     (let* ((a (nelisp-gpu--lower (nth 1 e))) (id (nelisp-gpu--newid)))
       (nelisp-gpu--emit 124 (list (nelisp-gpu--type :uint) id (car a)))

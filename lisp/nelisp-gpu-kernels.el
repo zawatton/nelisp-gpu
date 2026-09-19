@@ -690,6 +690,56 @@
                        (store (aref X idx) acc)))))
       nelisp-gpu-kernels)
 
+;; Quantize SEQ rows to int8 and pack four lanes per word, plus the per-row
+;; scale -- the input side of `bitlinear-dp4a-rows' done on the device.
+;;
+;; This is what lets a tensor that is already on the GPU feed an int8 linear.
+;; Without it an f32 intermediate has to come back to Elisp to be packed and go
+;; up again, and that round trip is the thing worth avoiding: the boundary
+;; costs about 3 microseconds a float out and 1.2 back, which is more than the
+;; arithmetic of most of a block.
+;;
+;; One thread per row.  The rounding is `uint(|q| + 0.5)' with a clamp at 127,
+;; matching `nl-llm-wgpu-pack-act' exactly rather than approximately -- these
+;; two produce the same bytes or the GPU and CPU paths stop being comparable.
+;; Lanes are assembled with multiplies because the DSL has no shifts, and the
+;; word is bitcast into the float buffer on the way out.
+(push (cons 'pack-act-rows
+            '(:buffers (X XQ GAMMA) :push (seq cols ng) :local-size 64
+              :body ((declare row :uint (gid-x))
+                     (when (< row seq)
+                       (declare base :uint (* row cols))
+                       (declare amax :float 0.0)
+                       (for (c 0 cols)
+                         (declare v :float (aref X (+ base c)))
+                         (declare av :float v)
+                         (when (< v 0.0) (set av (- 0.0 v)))
+                         (when (> av amax) (set amax av)))
+                       (declare gamma :float (/ amax 127.0))
+                       (store (aref GAMMA row) gamma)
+                       (declare wb :uint (* row ng))
+                       (for (w 0 ng)
+                         (declare word :uint 0)
+                         (declare sh :uint 1)
+                         (for (l 0 4)
+                           (declare c :uint (+ (* w 4) l))
+                           (declare lane :uint 0)
+                           (when (< c cols)
+                             (declare v :float (aref X (+ base c)))
+                             (declare q :float 0.0)
+                             (when (> gamma 0.0) (set q (/ v gamma)))
+                             (declare neg :uint 0)
+                             (declare aq :float q)
+                             (when (< q 0.0) (set neg 1) (set aq (- 0.0 q)))
+                             (declare ri :uint (uint (+ aq 0.5)))
+                             (when (> ri 127) (set ri 127))
+                             (set lane ri)
+                             (when (= neg 1) (set lane (% (- 256 ri) 256))))
+                           (set word (+ word (* lane sh)))
+                           (set sh (* sh 256)))
+                         (store (aref XQ (+ wb w)) (bitcast-f word)))))))
+      nelisp-gpu-kernels)
+
 ;; Causal grouped-query attention, one thread per (head, query position).
 ;; Q is SEQ x HEADS*HD, K and V are SEQ x KVHEADS*HD, CTX is SEQ x HEADS*HD,
 ;; all with RoPE and QK-norm already applied -- this is only the attention.
