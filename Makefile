@@ -12,7 +12,7 @@ M       ?= 512
 K       ?= 512
 NN      ?= 512
 
-.PHONY: host shaders run derisk el-derisk matmul-derisk verify clean tools-check server
+.PHONY: host shaders run derisk el-derisk matmul-derisk verify f32 clean tools-check server
 
 host: host/vkcompute
 
@@ -60,6 +60,12 @@ server: host/vkserver
 # Verify all DSL kernels on the GPU against the photon-tensor CPU oracle.
 verify: host/vkrun
 	$(EMACS) -Q --batch -L lisp -l test/verify.el
+
+# The float32 wire encoding.  No GPU: it is arithmetic, and it is the layer
+# every buffer and every shader constant passes through, so a defect here is
+# invisible in kernel comparisons and shows up as a wrong answer instead.
+f32:
+	$(EMACS) -Q --batch -L lisp -l test/f32-test.el
 
 tools-check:
 	@command -v $(GLSLANG) >/dev/null && echo "glslang: OK" || echo "glslang: MISSING (sudo apt-get install -y glslang-tools spirv-tools)"

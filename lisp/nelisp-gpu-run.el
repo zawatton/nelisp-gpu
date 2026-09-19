@@ -21,13 +21,18 @@
 (declare-function nelisp-gpu-server-run "nelisp-gpu-server" (name buffers push groups))
 
 (defun nelisp-gpu--bits-f32 (bits)
-  "Decode a 32-bit IEEE-754 BITS pattern to an elisp float."
+  "Decode a 32-bit IEEE-754 BITS pattern to an elisp float.
+An infinity decodes to an infinity and a NaN to a NaN.  They used to come back
+as 1.0e30, which reads as a large but finite answer and so turns a kernel that
+overflowed into one that merely returned a big number -- the caller cannot tell
+the difference, and a downstream comparison against a reference will report a
+plausible-looking relative error instead of a failure."
   (let* ((sign (if (zerop (logand bits #x80000000)) 1.0 -1.0))
          (exp (logand (ash bits -23) #xff))
          (mant (logand bits #x7fffff)))
     (cond ((and (= exp 0) (= mant 0)) (* sign 0.0))
           ((= exp 0)   (* sign (ldexp (/ mant 8388608.0) -126)))
-          ((= exp 255) (* sign 1.0e30))
+          ((= exp 255) (if (zerop mant) (* sign 1.0e+INF) 0.0e+NaN))
           (t (* sign (ldexp (+ 1.0 (/ mant 8388608.0)) (- exp 127)))))))
 
 (defun nelisp-gpu--write-floats (vectors path)

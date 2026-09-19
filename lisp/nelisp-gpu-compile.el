@@ -110,16 +110,50 @@ Dependencies are built first so they precede KEY in the binary stream."
           (nelisp-gpu--global 43 (list (nelisp-gpu--type :uint) id v))
           (puthash key id nelisp-gpu--cache) id))))
 
+(defconst nelisp-gpu--f32-min-normal 1.1754943508222875e-38
+  "Smallest positive normal float32, 2^-126.")
+(defconst nelisp-gpu--f32-min-subnormal 1.401298464324817e-45
+  "Smallest positive subnormal float32, 2^-149; also the subnormal step.")
+(defconst nelisp-gpu--f32-overflow 3.4028235677973366e38
+  "Smallest double that rounds to float32 infinity, (2 - 2^-24) * 2^127.")
+
 (defun nelisp-gpu--f32-bits (x)
-  "IEEE-754 single-precision bit pattern of float X as a uint."
+  "IEEE-754 single-precision bit pattern of float X as a uint.
+
+Magnitudes outside float32's range are handled explicitly, and that is the
+whole point of the function rather than a detail.  An earlier version masked
+the exponent with #xff and nothing else, so a number too small to represent
+came back *enormous*: 3.7e-44 encoded to 4.3e+33, 1e-39 to 1.2e+38, and a
+number too large came back tiny, 1e+300 to 5.6e-09.  Nothing signalled.
+
+That is reachable from ordinary data, not just extremes.  A softmax over a
+large vocabulary puts most of its mass below 1e-38, so a gradient built from
+one arrived at the GPU as garbage of order 1e33 -- which is how it was found:
+a transpose that agreed with the CPU to 1e-05 on pseudo-random input
+disagreed by 7.7e+30 on a real one."
   (setq x (float x))
-  (if (= x 0.0) 0
-    (let* ((sign (if (< x 0.0) 1 0)) (a (abs x))
-           (fe (frexp a)) (s (car fe)) (e (cdr fe))
-           (m2 (* 2.0 s)) (ee (+ e 126))
-           (m (round (* (- m2 1.0) 8388608.0))))
-      (when (>= m 8388608) (setq m 0 ee (1+ ee)))
-      (logior (ash sign 31) (ash (logand ee #xff) 23) (logand m #x7fffff)))))
+  (cond
+   ((isnan x) #x7fc00000)
+   ((= x 0.0) 0)
+   (t
+    (let ((sign (if (< x 0.0) 1 0)) (a (abs x)))
+      (cond
+       ;; Too large: an infinity, which at least propagates visibly.
+       ((>= a nelisp-gpu--f32-overflow) (logior (ash sign 31) #x7f800000))
+       ;; Too small to be normal: a subnormal, or zero if it rounds there.
+       ((< a nelisp-gpu--f32-min-normal)
+        (let ((m (round (/ a nelisp-gpu--f32-min-subnormal))))
+          (if (>= m 8388608)                  ; rounded up into the normals
+              (logior (ash sign 31) (ash 1 23))
+            (logior (ash sign 31) m))))
+       (t
+        (let* ((fe (frexp a)) (s (car fe)) (e (cdr fe))
+               (m2 (* 2.0 s)) (ee (+ e 126))
+               (m (round (* (- m2 1.0) 8388608.0))))
+          (when (>= m 8388608) (setq m 0 ee (1+ ee)))
+          (if (>= ee 255)
+              (logior (ash sign 31) #x7f800000)
+            (logior (ash sign 31) (ash ee 23) (logand m #x7fffff))))))))))
 
 (defun nelisp-gpu--const-float (v)
   (let ((key (list :cf v)))
