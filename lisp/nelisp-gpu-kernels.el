@@ -690,6 +690,63 @@
                        (store (aref X idx) acc)))))
       nelisp-gpu-kernels)
 
+;; RMSNorm applied per attention head, which is Qwen3's QK-norm: q and k are
+;; normalised within each head, with a shared HD-wide gain, BEFORE the rotation.
+;; One thread per (position, head).  EPS is 1e-6, matching the only value the
+;; callers use; it is not a push constant because push constants are uint32 and
+;; a float one would have to be smuggled through a bitcast for no gain.
+(push (cons 'rmsnorm-heads
+            '(:buffers (X G Y) :push (seq nheads hd) :local-size 64
+              :body ((declare idx :uint (gid-x))
+                     (when (< idx (* seq nheads))
+                       (declare base :uint (* idx hd))
+                       (declare ss :float 0.0)
+                       (for (i 0 hd)
+                         (declare v :float (aref X (+ base i)))
+                         (set ss (+ ss (* v v))))
+                       (declare inv :float
+                                (/ 1.0 (sqrt (+ (/ ss (float hd)) 0.000001))))
+                       (for (j 0 hd)
+                         (store (aref Y (+ base j))
+                                (* (* (aref X (+ base j)) inv) (aref G j))))))))
+      nelisp-gpu-kernels)
+
+;; Half-split rotary embedding -- the GPT-NeoX convention Qwen3 and Llama use,
+;; pairing element i with i + HD/2.  NOT `rope-apply', which pairs adjacent
+;; elements; the two disagree substantially (an 8-wide head at position 3
+;; differs by 5.8) and neither complains, because the vector is the right
+;; length either way.  That mismatch is one of the four silent convention
+;; errors this project has already paid for once.
+;;
+;; One thread per (position, head, pair).  Reads X and writes Y, so the two
+;; must be different buffers: the rotation needs both halves of the original.
+(push (cons 'rope-half
+            '(:buffers (X Y) :push (seq nheads hd rbase) :local-size 64
+              :body ((declare idx :uint (gid-x))
+                     (declare half :uint (/ hd 2))
+                     (when (< idx (* (* seq nheads) half))
+                       (declare m :uint (% idx half))
+                       (declare tmp :uint (/ idx half))
+                       (declare h :uint (% tmp nheads))
+                       (declare p :uint (/ tmp nheads))
+                       (declare b0 :uint (+ (* p (* nheads hd)) (* h hd)))
+                       (declare ex :float (/ (* 2.0 (float m)) (float hd)))
+                       ;; RBASE arrives as the float's bit pattern, not as an
+                       ;; integer: push constants are uint32 and a rope base is
+                       ;; a float in the config (1000000.0).  Truncating it
+                       ;; would work for every base anyone uses and quietly
+                       ;; stop working for one that is not integral.
+                       (declare theta :float
+                                (/ (float p) (pow (bitcast-f rbase) ex)))
+                       (declare c :float (cos theta))
+                       (declare s :float (sin theta))
+                       (declare a0 :float (aref X (+ b0 m)))
+                       (declare a1 :float (aref X (+ b0 (+ m half))))
+                       (store (aref Y (+ b0 m)) (- (* a0 c) (* a1 s)))
+                       (store (aref Y (+ b0 (+ m half)))
+                              (+ (* a1 c) (* a0 s)))))))
+      nelisp-gpu-kernels)
+
 ;; Quantize SEQ rows to int8 and pack four lanes per word, plus the per-row
 ;; scale -- the input side of `bitlinear-dp4a-rows' done on the device.
 ;;

@@ -257,6 +257,18 @@ disagreed by 7.7e+30 on a real one."
       (nelisp-gpu--emit 12 (list (nelisp-gpu--type :float) id
                                  nelisp-gpu--glsl 31 (car a)))  ; GLSL Sqrt
       (cons id :float)))
+   ;; sin, cos and pow, which a rotary embedding needs and nothing here had.
+   ((memq (car-safe e) '(sin cos))
+    (let* ((a (nelisp-gpu--lower (nth 1 e))) (id (nelisp-gpu--newid)))
+      (nelisp-gpu--emit 12 (list (nelisp-gpu--type :float) id nelisp-gpu--glsl
+                                 (if (eq (car e) 'sin) 13 14) (car a)))
+      (cons id :float)))
+   ((eq (car-safe e) 'pow)
+    (let* ((a (nelisp-gpu--lower (nth 1 e))) (b (nelisp-gpu--lower (nth 2 e)))
+           (id (nelisp-gpu--newid)))
+      (nelisp-gpu--emit 12 (list (nelisp-gpu--type :float) id
+                                 nelisp-gpu--glsl 26 (car a) (car b)))  ; GLSL Pow
+      (cons id :float)))
    ((eq (car-safe e) 'float)
     (let ((a (nelisp-gpu--lower (nth 1 e))))
       (cond ((eq (cdr a) :float) a)
