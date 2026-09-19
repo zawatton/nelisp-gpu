@@ -690,6 +690,64 @@
                        (store (aref X idx) acc)))))
       nelisp-gpu-kernels)
 
+;; Causal grouped-query attention, one thread per (head, query position).
+;; Q is SEQ x HEADS*HD, K and V are SEQ x KVHEADS*HD, CTX is SEQ x HEADS*HD,
+;; all with RoPE and QK-norm already applied -- this is only the attention.
+;;
+;; Three passes over the keys rather than two, because a thread cannot hold a
+;; row of scores: their length is SEQ, which is a push constant, and the DSL
+;; has no runtime-sized private array.  So the score for (i,j) is recomputed
+;; for the maximum, for the sum, and again while accumulating.  That is four
+;; dot products of length HD per key instead of two, which is the right trade
+;; on a GPU and the wrong one in Elisp -- where this loop costs 311s a step at
+;; seq 48 precisely because it is quadratic and interpreted.
+;;
+;; The accumulation goes through CTX itself instead of a register array, for
+;; the same reason.  Each thread owns one (i, head) slice of it, so there is
+;; no sharing and no barrier.
+(push (cons 'attn-causal-gqa
+            '(:buffers (Q K V CTX) :push (seq heads kvheads hd) :local-size 64
+              :body ((declare idx :uint (gid-x))
+                     (when (< idx (* heads seq))
+                       (declare h :uint (/ idx seq))
+                       (declare i :uint (% idx seq))
+                       (declare qdim :uint (* heads hd))
+                       (declare kvdim :uint (* kvheads hd))
+                       (declare grp :uint (/ heads kvheads))
+                       (declare qb :uint (+ (* i qdim) (* h hd)))
+                       (declare kc :uint (* (/ h grp) hd))
+                       (declare scale :float (/ 1.0 (sqrt (float hd))))
+                       (declare n :uint (+ i 1))
+                       ;; pass 1: the maximum, so the exponential cannot overflow
+                       (declare mx :float -1.0e30)
+                       (for (j 0 n)
+                         (declare kb :uint (+ (* j kvdim) kc))
+                         (declare acc :float 0.0)
+                         (for (t 0 hd)
+                           (set acc (+ acc (* (aref Q (+ qb t)) (aref K (+ kb t))))))
+                         (set acc (* acc scale))
+                         (when (> acc mx) (set mx acc)))
+                       ;; pass 2: the normaliser
+                       (declare sm :float 0.0)
+                       (for (j 0 n)
+                         (declare kb :uint (+ (* j kvdim) kc))
+                         (declare acc :float 0.0)
+                         (for (t 0 hd)
+                           (set acc (+ acc (* (aref Q (+ qb t)) (aref K (+ kb t))))))
+                         (set sm (+ sm (exp (- (* acc scale) mx)))))
+                       ;; pass 3: the context, accumulated in place
+                       (for (t 0 hd) (store (aref CTX (+ qb t)) 0.0))
+                       (for (j 0 n)
+                         (declare kb :uint (+ (* j kvdim) kc))
+                         (declare acc :float 0.0)
+                         (for (t 0 hd)
+                           (set acc (+ acc (* (aref Q (+ qb t)) (aref K (+ kb t))))))
+                         (declare pj :float (/ (exp (- (* acc scale) mx)) sm))
+                         (for (t 0 hd)
+                           (store (aref CTX (+ qb t))
+                                  (+ (aref CTX (+ qb t)) (* pj (aref V (+ kb t)))))))))))
+      nelisp-gpu-kernels)
+
 ;; --- BitNet b1.58 Phase B: packed ternary-weight matmul ---------------------
 ;; Ternary weights are packed as base-4 codes (tern+1 in {0,1,2}), PK codes per
 ;; f32 (so the weight buffer is PK x smaller -- bandwidth/VRAM win on Pascal).
