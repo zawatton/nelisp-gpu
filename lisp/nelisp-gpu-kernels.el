@@ -690,6 +690,17 @@
                        (store (aref X idx) acc)))))
       nelisp-gpu-kernels)
 
+;; C = A + B, elementwise.  There is a hand-built `vadd' SPIR-V module in
+;; nelisp-gpu-spirv.el, but a residual connection inside a fused block wants a
+;; kernel whose buffer order and push constants are the same shape as every
+;; other kernel here, rather than one whose ABI has to be looked up.
+(push (cons 'add2
+            '(:buffers (A B C) :push (n) :local-size 64
+              :body ((declare i :uint (gid-x))
+                     (when (< i n)
+                       (store (aref C i) (+ (aref A i) (aref B i)))))))
+      nelisp-gpu-kernels)
+
 ;; RMSNorm applied per attention head, which is Qwen3's QK-norm: q and k are
 ;; normalised within each head, with a shared HD-wide gain, BEFORE the rotation.
 ;; One thread per (position, head).  EPS is 1e-6, matching the only value the

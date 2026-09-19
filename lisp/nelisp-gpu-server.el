@@ -80,7 +80,7 @@
                              dp4a-dot bitlinear-dp4a bitlinear-dp4a-1f
                              bitlinear-dp4a-rows dp4a-rows-t
                              attn-causal-gqa pack-act-rows
-                             rmsnorm-heads rope-half
+                             rmsnorm-heads rope-half add2
                              gather-spike scatter-spike
                              cache-append-paged decode-attn-paged)))
       (nelisp-gpu-write-kernel k (expand-file-name (format "%s.spv" k) dir)))
