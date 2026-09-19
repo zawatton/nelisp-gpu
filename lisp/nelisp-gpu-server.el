@@ -78,6 +78,7 @@
                              block-copy tree-attn qkv-append attn-stream-entries
                              absmean-acc quant-w quant-act bitlinear-packed bitlinear-packed-v
                              dp4a-dot bitlinear-dp4a bitlinear-dp4a-1f
+                             bitlinear-dp4a-rows
                              gather-spike scatter-spike
                              cache-append-paged decode-attn-paged)))
       (nelisp-gpu-write-kernel k (expand-file-name (format "%s.spv" k) dir)))
@@ -131,6 +132,33 @@ verbatim (e.g. four int8 lanes packed per word, read back in a kernel via
                       (mapconcat #'nelisp-gpu--u32-bytes (append uvec nil) "")))
          (buf (nelisp-gpu--server-xfer req 8)))
     (unless (zerop (nelisp-gpu--u32-at buf 0)) (error "vkserver upload-u32 error"))
+    (nelisp-gpu--u32-at buf 4)))
+
+(defun nelisp-gpu-server-upload-bytes (bytes)
+  "Upload BYTES to a persistent GPU buffer verbatim; return its integer handle.
+BYTES is a unibyte string holding little-endian uint32 words -- e.g. four int8
+lanes per word, read back in a kernel with `bitcast-u'.
+
+This exists because `nelisp-gpu-server-upload-u32' takes a vector of Elisp
+integers and lists it before encoding, which is fine for a kernel's worth of
+words and hopeless for a model's: an imported Qwen3-0.6B is ~149M words, so
+that path would build a 1.2 GB vector and a 2.4 GB list in order to send bytes
+that are already laid out correctly on disk.  Here the caller hands over the
+bytes it read and nothing is allocated per word."
+  (unless (stringp bytes)
+    (error "upload-bytes: BYTES must be a string, got %S" (type-of bytes)))
+  (when (multibyte-string-p bytes)
+    (error "upload-bytes: BYTES must be unibyte (got a multibyte string, \
+which would be re-encoded rather than sent verbatim)"))
+  (unless (zerop (% (length bytes) 4))
+    (error "upload-bytes: %d bytes is not a whole number of uint32 words"
+           (length bytes)))
+  (let* ((req (concat (nelisp-gpu--u32-bytes nelisp-gpu--op-upload)
+                      (nelisp-gpu--u32-bytes (/ (length bytes) 4))
+                      bytes))
+         (buf (nelisp-gpu--server-xfer req 8)))
+    (unless (zerop (nelisp-gpu--u32-at buf 0))
+      (error "vkserver upload-bytes error"))
     (nelisp-gpu--u32-at buf 4)))
 
 (defun nelisp-gpu-server-free (handle)

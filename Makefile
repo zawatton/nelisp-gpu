@@ -12,7 +12,7 @@ M       ?= 512
 K       ?= 512
 NN      ?= 512
 
-.PHONY: host shaders run derisk el-derisk matmul-derisk verify clean tools-check
+.PHONY: host shaders run derisk el-derisk matmul-derisk verify clean tools-check server
 
 host: host/vkcompute
 
@@ -49,6 +49,14 @@ matmul-derisk: host/vkmatmul
 host/vkrun: host/vkrun.c
 	$(CC) -O2 host/vkrun.c -lvulkan -o $@
 
+# The persistent server `nelisp-gpu-server.el' talks to.  It had no rule here,
+# so a fresh checkout could not build the binary that every resident-weight
+# path depends on.
+host/vkserver: host/vkserver.c
+	$(CC) -O2 host/vkserver.c -lvulkan -o $@
+
+server: host/vkserver
+
 # Verify all DSL kernels on the GPU against the photon-tensor CPU oracle.
 verify: host/vkrun
 	$(EMACS) -Q --batch -L lisp -l test/verify.el
@@ -59,4 +67,4 @@ tools-check:
 	@command -v spirv-dis   >/dev/null && echo "spirv-dis: OK" || echo "spirv-dis: MISSING"
 
 clean:
-	rm -f host/vkcompute kernels/*.spv
+	rm -f host/vkcompute host/vkmatmul host/vkrun host/vkserver kernels/*.spv

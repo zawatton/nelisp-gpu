@@ -2,6 +2,7 @@
 /host/vkmatmul
 /host/vksoftmax
 /host/vkrun
+/host/vkserver
 kernels/*.spv
 *.elc
 *.eln

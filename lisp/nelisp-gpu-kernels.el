@@ -633,6 +633,25 @@
                        (store (aref Y idx) (+ (aref BIAS o) (* (* (aref BETA 0) (aref GAMMA s)) (float acc))))))))
       nelisp-gpu-kernels)
 
+;; Per-output-row weight scales.  A sibling of `bitlinear-dp4a-1f' rather than a
+;; re-index of it: that kernel's BETA is read as BETA[0] and its callers in
+;; nl-llm-bitnet.el pass a ONE-element buffer, so indexing it by the output row
+;; would read past the end of the ternary path's uploads.  Imported weights are
+;; quantized per row -- a single scale is set by the largest row and wastes most
+;; of the int8 range on the others -- so they need BETA of length `out'.
+(push (cons 'bitlinear-dp4a-rows
+            '(:buffers (AP WP BIAS BETA GAMMA Y) :push (seq out ng) :local-size 64
+              :body ((declare idx :uint (gid-x))
+                     (when (< idx (* seq out))
+                       (declare s :uint (/ idx out)) (declare o :uint (% idx out))
+                       (declare ab :uint (* s ng)) (declare wb :uint (* o ng)) (declare acc :int 0)
+                       (for (g 0 ng)
+                         (declare apk :uint (bitcast-u (aref AP (+ ab g))))
+                         (declare wpk :uint (bitcast-u (aref WP (+ wb g))))
+                         (set acc (+ acc (sdot apk wpk))))
+                       (store (aref Y idx) (+ (aref BIAS o) (* (* (aref BETA o) (aref GAMMA s)) (float acc))))))))
+      nelisp-gpu-kernels)
+
 ;; --- BitNet b1.58 Phase B: packed ternary-weight matmul ---------------------
 ;; Ternary weights are packed as base-4 codes (tern+1 in {0,1,2}), PK codes per
 ;; f32 (so the weight buffer is PK x smaller -- bandwidth/VRAM win on Pascal).
