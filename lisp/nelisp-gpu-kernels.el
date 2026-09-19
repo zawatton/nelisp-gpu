@@ -731,8 +731,12 @@
 ;;
 ;; One thread per (position, head, pair).  Reads X and writes Y, so the two
 ;; must be different buffers: the rotation needs both halves of the original.
+;; SGN is the sine's sign, as a float bit pattern: +1 rotates, -1 rotates back.
+;; The inverse of (a0 c - a1 s, a1 c + a0 s) is (a0 c + a1 s, a1 c - a0 s), so
+;; the backward is this kernel with the sine negated and nothing else -- which
+;; is worth having as one kernel rather than two that could drift apart.
 (push (cons 'rope-half
-            '(:buffers (X Y) :push (seq nheads hd rbase) :local-size 64
+            '(:buffers (X Y) :push (seq nheads hd rbase sgn) :local-size 64
               :body ((declare idx :uint (gid-x))
                      (declare half :uint (/ hd 2))
                      (when (< idx (* (* seq nheads) half))
@@ -750,7 +754,7 @@
                        (declare theta :float
                                 (/ (float p) (pow (bitcast-f rbase) ex)))
                        (declare c :float (cos theta))
-                       (declare s :float (sin theta))
+                       (declare s :float (* (bitcast-f sgn) (sin theta)))
                        (declare a0 :float (aref X (+ b0 m)))
                        (declare a1 :float (aref X (+ b0 (+ m half))))
                        (store (aref Y (+ b0 m)) (- (* a0 c) (* a1 s)))
