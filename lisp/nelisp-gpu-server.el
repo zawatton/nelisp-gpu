@@ -24,6 +24,7 @@
 (defconst nelisp-gpu--op-run-compiled 5)
 (defconst nelisp-gpu--op-free-compiled 6)
 (defconst nelisp-gpu--op-write-resident 7)
+(defconst nelisp-gpu--op-upload-file 8)
 
 (defvar nelisp-gpu-server-bin "host/vkserver"
   "Path to the persistent server binary (relative to `default-directory').")
@@ -161,6 +162,29 @@ which would be re-encoded rather than sent verbatim)"))
          (buf (nelisp-gpu--server-xfer req 8)))
     (unless (zerop (nelisp-gpu--u32-at buf 0))
       (error "vkserver upload-bytes error"))
+    (nelisp-gpu--u32-at buf 4)))
+
+(defun nelisp-gpu-server-upload-file (path offset nbytes)
+  "Upload the NBYTES at OFFSET of PATH into a resident buffer; return its handle.
+
+The bytes are read by the server and never enter Emacs.  `process-send-string'
+moves about 3 MB/s into a pipe -- measured on this machine against 147 MB/s for
+the same string written to a file -- so a model's worth of weights sent through
+`nelisp-gpu-server-upload-bytes' is bounded by the pipe and not by the GPU.
+OFFSET and NBYTES are byte counts and may exceed 32 bits; NBYTES must be a whole
+number of uint32 words."
+  (unless (zerop (% nbytes 4))
+    (error "upload-file: %d bytes is not a whole number of uint32 words" nbytes))
+  (let* ((full (encode-coding-string (expand-file-name path) 'utf-8 t))
+         (req (concat (nelisp-gpu--u32-bytes nelisp-gpu--op-upload-file)
+                      (nelisp-gpu--u32-bytes (length full))
+                      full
+                      (nelisp-gpu--u32-bytes (logand offset #xffffffff))
+                      (nelisp-gpu--u32-bytes (ash offset -32))
+                      (nelisp-gpu--u32-bytes (/ nbytes 4))))
+         (buf (nelisp-gpu--server-xfer req 8)))
+    (unless (zerop (nelisp-gpu--u32-at buf 0))
+      (error "vkserver upload-file error (%s +%d, %d bytes)" path offset nbytes))
     (nelisp-gpu--u32-at buf 4)))
 
 (defun nelisp-gpu-server-free (handle)

@@ -67,6 +67,9 @@ verify: host/vkrun
 f32:
 	$(EMACS) -Q --batch -L lisp -l test/f32-test.el
 
+upload-file: host/vkserver
+	$(EMACS) -Q --batch -L lisp -l test/upload-file-test.el
+
 tools-check:
 	@command -v $(GLSLANG) >/dev/null && echo "glslang: OK" || echo "glslang: MISSING (sudo apt-get install -y glslang-tools spirv-tools)"
 	@command -v spirv-val   >/dev/null && echo "spirv-val: OK" || echo "spirv-val: MISSING"

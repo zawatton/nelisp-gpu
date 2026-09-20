@@ -27,7 +27,18 @@
  *
  *   OP_FREE=2: u32 handle;
  *   Response: u32 status.
+ *
+ *   OP_UPLOAD_FILE=8: u32 pathlen; char path[pathlen]; u32 off_lo; u32 off_hi;
+ *                     u32 nfloats;
+ *   Response: u32 status; u32 handle.
+ *   The bytes never cross the pipe.  Emacs `process-send-string' moves about
+ *   3 MB/s to a pipe -- measured against 147 MB/s for the same string written
+ *   to a file -- so shipping a 27 GB model through stdin costs hours that have
+ *   nothing to do with the GPU.  Here the caller sends a path and the server
+ *   reads the region straight into mapped device memory.
  */
+#define _FILE_OFFSET_BITS 64
+#include <sys/types.h>
 #include <vulkan/vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +55,7 @@
 #define OP_RUN_COMPILED 5
 #define OP_FREE_COMPILED 6
 #define OP_WRITE_RESIDENT 7
+#define OP_UPLOAD_FILE 8
 
 static VkInstance inst;
 static VkPhysicalDevice pd;
@@ -266,6 +278,43 @@ static void handle_write_resident(void){
   free(data); fflush(stdout);
 }
 
+/* OP_UPLOAD_FILE: read NFLOATS*4 bytes at OFF of PATH straight into a fresh
+ * resident buffer's mapped memory.  No host copy and no pipe traffic. */
+static void handle_upload_file(void){
+  uint32_t plen, olo, ohi, n;
+  if(!rd_u32(&plen)) exit(0);
+  if(plen==0||plen>4095){ fprintf(stderr,"vkserver: bad path length %u\n",plen); exit(0); }
+  char path[4096];
+  if(fread(path,1,plen,stdin)!=plen) exit(0);
+  path[plen]=0;
+  if(!rd_u32(&olo)) exit(0);
+  if(!rd_u32(&ohi)) exit(0);
+  if(!rd_u32(&n)) exit(0);
+  uint64_t off=((uint64_t)ohi<<32)|olo;
+  FILE *f=fopen(path,"rb");
+  if(!f){ fprintf(stderr,"vkserver: cannot open %s\n",path); wr_u32(1); wr_u32(0); fflush(stdout); return; }
+  if(fseeko(f,(off_t)off,SEEK_SET)!=0){ fprintf(stderr,"vkserver: seek %s\n",path); fclose(f); wr_u32(1); wr_u32(0); fflush(stdout); return; }
+  int h=-1;
+  for(int i=0;i<nres;i++) if(!res[i].used){ h=i; break; }
+  if(h<0){
+    if(nres>=MAXRES){ fprintf(stderr,"vkserver: resident table full\n"); fclose(f); wr_u32(1); wr_u32(0); fflush(stdout); return; }
+    h=nres++;
+  }
+  make_buffer(n,&res[h].buf,&res[h].mem); res[h].size=n; res[h].used=1;
+  if(n){
+    void *p; VK_CHECK(vkMapMemory(dev,res[h].mem,0,(VkDeviceSize)n*4,0,&p));
+    size_t want=(size_t)n*4, got=fread(p,1,want,f);
+    vkUnmapMemory(dev,res[h].mem);
+    if(got!=want){
+      fprintf(stderr,"vkserver: %s short read %zu of %zu\n",path,got,want);
+      vkDestroyBuffer(dev,res[h].buf,NULL); vkFreeMemory(dev,res[h].mem,NULL);
+      res[h].used=0; fclose(f); wr_u32(1); wr_u32(0); fflush(stdout); return;
+    }
+  }
+  fclose(f);
+  wr_u32(0); wr_u32((uint32_t)h); fflush(stdout);
+}
+
 static void handle_free(void){
   uint32_t h; if(!rd_u32(&h)) exit(0);
   if(h<(uint32_t)nres && res[h].used){
@@ -486,6 +535,7 @@ int main(int argc,char**argv){
     else if(op==OP_RUN_COMPILED) handle_run_compiled();
     else if(op==OP_FREE_COMPILED) handle_free_compiled();
     else if(op==OP_WRITE_RESIDENT) handle_write_resident();
+    else if(op==OP_UPLOAD_FILE) handle_upload_file();
     else { fprintf(stderr,"vkserver: bad opcode %u\n",op); return 2; }
   }
   return 0;
