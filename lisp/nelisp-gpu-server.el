@@ -80,6 +80,7 @@
                              absmean-acc quant-w quant-act bitlinear-packed bitlinear-packed-v
                              dp4a-dot bitlinear-dp4a bitlinear-dp4a-1f
                              bitlinear-dp4a-rows dp4a-rows-t
+                             ternary-rows ternary-rows-t
                              attn-causal-gqa pack-act-rows
                              rmsnorm-heads rope-half add2
                              gather-spike scatter-spike

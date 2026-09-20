@@ -12,7 +12,7 @@ M       ?= 512
 K       ?= 512
 NN      ?= 512
 
-.PHONY: host shaders run derisk el-derisk matmul-derisk verify f32 clean tools-check server
+.PHONY: host shaders run derisk el-derisk matmul-derisk verify f32 clean tools-check server ternary-kernel upload-file
 
 host: host/vkcompute
 
@@ -66,6 +66,9 @@ verify: host/vkrun
 # invisible in kernel comparisons and shows up as a wrong answer instead.
 f32:
 	$(EMACS) -Q --batch -L lisp -l test/f32-test.el
+
+ternary-kernel: host/vkserver
+	$(EMACS) -Q --batch -L lisp -l test/ternary-kernel-test.el
 
 upload-file: host/vkserver
 	$(EMACS) -Q --batch -L lisp -l test/upload-file-test.el

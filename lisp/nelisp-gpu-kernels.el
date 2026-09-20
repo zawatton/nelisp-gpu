@@ -652,6 +652,73 @@
                        (store (aref Y idx) (+ (aref BIAS o) (* (* (aref BETA o) (aref GAMMA s)) (float acc))))))))
       nelisp-gpu-kernels)
 
+;; Ternary weights: sixteen two-bit fields per word, one scale per 128 columns.
+;;
+;; No DP4A here, and that is the point rather than an omission.  The weight is
+;; -1, 0 or +1, so the product is a float add or subtract and there is nothing
+;; for an int8 dot product to accelerate; taking the activation as float
+;; instead of packing it to int8 costs an instruction per weight and removes
+;; the activation quantization entirely, which is the only lossy step left in
+;; this path once the weights stop being requantized.  Against the int8 kernel
+;; it reads a quarter of the bytes.
+;;
+;; The scale is per 128-column block, so the accumulator flushes at block
+;; boundaries -- eight words of sixteen fields each.  `sh' walks the fields by
+;; multiplying by four, which keeps the shift out of the inner loop.
+(push (cons 'ternary-rows
+            '(:buffers (X WP BIAS BETA Y) :push (seq out cols nblk wng)
+              :local-size 64
+              :body ((declare idx :uint (gid-x))
+                     (when (< idx (* seq out))
+                       (declare s :uint (/ idx out))
+                       (declare o :uint (% idx out))
+                       (declare xb :uint (* s cols))
+                       (declare wb :uint (* o wng))
+                       (declare acc :float 0.0)
+                       (for (b 0 nblk)
+                         (declare bacc :float 0.0)
+                         (for (w 0 8)
+                           (declare wi :uint (+ (* b 8) w))
+                           (when (< wi wng)
+                             (declare wpk :uint (bitcast-u (aref WP (+ wb wi))))
+                             (declare sh :uint 1)
+                             (for (f 0 16)
+                               (declare i :uint (+ (* wi 16) f))
+                               (when (< i cols)
+                                 (declare v :uint (% (/ wpk sh) 4))
+                                 (declare sv :float
+                                          (- (float v) (* 4.0 (float (/ v 3)))))
+                                 (set bacc (+ bacc (* sv (aref X (+ xb i))))))
+                               (set sh (* sh 4)))))
+                         (set acc (+ acc (* (aref BETA (+ (* o nblk) b)) bacc))))
+                       (store (aref Y idx) (+ (aref BIAS o) acc))))))
+      nelisp-gpu-kernels)
+
+;; The transpose of `ternary-rows': X = W^T . G, with the scale read per
+;; (output row, input block) rather than per output row.
+(push (cons 'ternary-rows-t
+            '(:buffers (WP BETA G X) :push (out cols nblk wng seq)
+              :local-size 64
+              :body ((declare idx :uint (gid-x))
+                     (when (< idx (* seq cols))
+                       (declare p :uint (/ idx cols))
+                       (declare i :uint (% idx cols))
+                       (declare b :uint (/ i 128))
+                       (declare wi :uint (/ i 16))
+                       (declare fd :uint (% i 16))
+                       (declare sh :uint 1)
+                       (for (l 0 fd) (set sh (* sh 4)))
+                       (declare gb :uint (* p out))
+                       (declare acc :float 0.0)
+                       (for (o 0 out)
+                         (declare wpk :uint (bitcast-u (aref WP (+ (* o wng) wi))))
+                         (declare v :uint (% (/ wpk sh) 4))
+                         (declare sv :float (- (float v) (* 4.0 (float (/ v 3)))))
+                         (set acc (+ acc (* sv (* (aref BETA (+ (* o nblk) b))
+                                                  (aref G (+ gb o)))))))
+                       (store (aref X idx) acc)))))
+      nelisp-gpu-kernels)
+
 ;; The transpose of `bitlinear-dp4a-rows': X = W^T . (BETA * G), for a weight
 ;; stored row-major with four int8 lanes per word and a scale per output row.
 ;; This is the gradient of a linear with respect to its input, which a frozen
