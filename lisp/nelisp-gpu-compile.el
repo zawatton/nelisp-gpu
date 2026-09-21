@@ -247,6 +247,30 @@ disagreed by 7.7e+30 on a real one."
       (nelisp-gpu--emit (nelisp-gpu--arith-op (car e) ty)
                         (list (nelisp-gpu--type ty) id (car a) (car b)))
       (cons id ty)))
+   ;; Bitwise and shifts.  The ternary unpack could say "take 2-bit field f"
+   ;; only as a division by a running power of four, so it spent a full 32-bit
+   ;; OpUDiv with a *variable* divisor per field -- 5120 of them per output
+   ;; element, which no driver can strength-reduce.  A shift is the same value
+   ;; for a single cycle, and an arithmetic shift sign-extends the field for
+   ;; free, which is why the format stores -1 as two's-complement 11.
+   ((memq (car-safe e) '(& bor bxor << >> >>s))
+    (let* ((a (nelisp-gpu--lower (nth 1 e))) (b (nelisp-gpu--lower (nth 2 e)))
+           (id (nelisp-gpu--newid))
+           (op (pcase (car e)
+                 (`& 199) (`bor 197) (`bxor 198)
+                 (`<< 196) (`>> 194) (`>>s 195) (_ nil))))
+      (unless (memq (cdr a) '(:uint :int))
+        (error "nelisp-gpu: %S needs an integer, got %S" (car e) (cdr a)))
+      ;; SPIR-V lets a shift count differ in type from its base but requires
+      ;; both operands of a bitwise op to match, so only the latter is checked.
+      (when (and (memq (car e) '(& bor bxor)) (not (eq (cdr a) (cdr b))))
+        (error "nelisp-gpu: type mismatch in %S (%S vs %S)" e (cdr a) (cdr b)))
+      (nelisp-gpu--emit op (list (nelisp-gpu--type (cdr a)) id (car a) (car b)))
+      (cons id (cdr a))))
+   ((eq (car-safe e) 'bitcast-i)          ; reinterpret a uint32's bits as int32
+    (let* ((a (nelisp-gpu--lower (nth 1 e))) (id (nelisp-gpu--newid)))
+      (nelisp-gpu--emit 124 (list (nelisp-gpu--type :int) id (car a)))
+      (cons id :int)))
    ((eq (car-safe e) 'exp)
     (let* ((a (nelisp-gpu--lower (nth 1 e))) (id (nelisp-gpu--newid)))
       (nelisp-gpu--emit 12 (list (nelisp-gpu--type :float) id

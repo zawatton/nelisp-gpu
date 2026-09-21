@@ -726,15 +726,21 @@
                            (declare wi :uint (+ (* b 8) w))
                            (when (< wi wng)
                              (declare wpk :uint (bitcast-u (aref WP (+ wb wi))))
-                             (declare sh :uint 1)
+                             ;; Field f lives in bits 2f..2f+1, so shifting it
+                             ;; up to the sign bit and back down arithmetically
+                             ;; both selects and sign-extends it: 00 -> 0,
+                             ;; 01 -> +1, 11 -> -1.  The obvious spelling --
+                             ;; divide by a running power of four -- costs a
+                             ;; 32-bit OpUDiv with a variable divisor per field,
+                             ;; and there are COLS of them per output element.
+                             (declare sh :uint 30)
                              (for (f 0 16)
                                (declare i :uint (+ (* wi 16) f))
                                (when (< i cols)
-                                 (declare v :uint (% (/ wpk sh) 4))
                                  (declare sv :float
-                                          (- (float v) (* 4.0 (float (/ v 3)))))
+                                          (float (>>s (bitcast-i (<< wpk sh)) 30)))
                                  (set bacc (+ bacc (* sv (aref X (+ xb i))))))
-                               (set sh (* sh 4)))))
+                               (set sh (- sh 2)))))
                          (set acc (+ acc (* (aref BETA (+ (* o nblk) b)) bacc))))
                        (store (aref Y idx) (+ (aref BIAS o) acc))))))
       nelisp-gpu-kernels)
@@ -751,14 +757,15 @@
                        (declare b :uint (/ i 128))
                        (declare wi :uint (/ i 16))
                        (declare fd :uint (% i 16))
-                       (declare sh :uint 1)
-                       (for (l 0 fd) (set sh (* sh 4)))
+                       ;; Was a loop of FD multiplications to build a divisor,
+                       ;; per thread, before the first weight was even read.
+                       (declare sh :uint (- 30 (* 2 fd)))
                        (declare gb :uint (* p out))
                        (declare acc :float 0.0)
                        (for (o 0 out)
                          (declare wpk :uint (bitcast-u (aref WP (+ (* o wng) wi))))
-                         (declare v :uint (% (/ wpk sh) 4))
-                         (declare sv :float (- (float v) (* 4.0 (float (/ v 3)))))
+                         (declare sv :float
+                                  (float (>>s (bitcast-i (<< wpk sh)) 30)))
                          (set acc (+ acc (* sv (* (aref BETA (+ (* o nblk) b))
                                                   (aref G (+ gb o)))))))
                        (store (aref X idx) acc)))))
