@@ -127,5 +127,24 @@ int main(int argc,char**argv){
   memcpy(host+off,p,(size_t)sizes[i]*4);vkUnmapMemory(dev,mem[i]);off+=sizes[i];}
  FILE*of=fopen(outp,"wb");if(!of){fprintf(stderr,"open %s\n",outp);return 2;}
  fwrite(host,4,total,of);fclose(of);
+
+ /* Tear the device down explicitly.  Without this the answer was already on
+  * disk and the process still died ~15% of the time, in the driver's own
+  * exit-time destructors racing its worker threads -- which made `make
+  * verify' fail on a random one of its thirty kernels and look like a kernel
+  * defect.  The one-shot runner had simply returned from main and left every
+  * Vulkan object alive. */
+ VK_CHECK(vkDeviceWaitIdle(dev));
+ vkDestroyFence(dev,fence,NULL);
+ vkFreeCommandBuffers(dev,cpool,1,&cmd);
+ vkDestroyCommandPool(dev,cpool,NULL);
+ vkDestroyDescriptorPool(dev,dp,NULL);
+ vkDestroyPipeline(dev,pipe,NULL);
+ vkDestroyPipelineLayout(dev,pl,NULL);
+ vkDestroyDescriptorSetLayout(dev,dsl,NULL);
+ vkDestroyShaderModule(dev,sm,NULL);
+ for(int i=0;i<nbuf;i++){vkDestroyBuffer(dev,buf[i],NULL);vkFreeMemory(dev,mem[i],NULL);}
+ vkDestroyDevice(dev,NULL);
+ vkDestroyInstance(inst,NULL);
  return 0;
 }
