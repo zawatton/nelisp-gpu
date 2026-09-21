@@ -652,6 +652,51 @@
                        (store (aref Y idx) (+ (aref BIAS o) (* (* (aref BETA o) (aref GAMMA s)) (float acc))))))))
       nelisp-gpu-kernels)
 
+;; One position of the gated delta rule, for every head at once.
+;;
+;;   S  <- g_t S
+;;   m  <- S' k~
+;;   d  <- beta_t (v - m)
+;;   S  <- S + k~ (x) d
+;;   o  <- S' q~
+;;
+;; The recurrence is sequential in t and completely parallel in everything
+;; else: for a fixed head and a fixed output dimension j, the whole update
+;; touches only column j of that head's state.  So a thread owns a column,
+;; there is no sharing between threads within a position, and the caller
+;; dispatches this once per position with T as a push constant while the
+;; state stays in a tmp slot across the batch.
+;;
+;; S is [head][i][j], Q and K are [t][head][i], V and OUT are [t][head][j].
+;; Reading and writing S in the same thread is safe because the column a
+;; thread touches is its own.
+(push (cons 'gdn-step
+            '(:buffers (S Q K V G B OUT) :push (nv dk dv t) :local-size 64
+              :body ((declare idx :uint (gid-x))
+                     (when (< idx (* nv dv))
+                       (declare h :uint (/ idx dv))
+                       (declare j :uint (% idx dv))
+                       (declare sb :uint (+ (* h (* dk dv)) j))
+                       (declare qb :uint (* (+ (* t nv) h) dk))
+                       (declare vb :uint (+ (* (+ (* t nv) h) dv) j))
+                       (declare gv :float (aref G (+ (* t nv) h)))
+                       (declare bv :float (aref B (+ (* t nv) h)))
+                       (declare mem :float 0.0)
+                       (for (i 0 dk)
+                         (declare p :uint (+ sb (* i dv)))
+                         (declare sv :float (* (aref S p) gv))
+                         (store (aref S p) sv)
+                         (set mem (+ mem (* sv (aref K (+ qb i))))))
+                       (declare d :float (* bv (- (aref V vb) mem)))
+                       (declare o :float 0.0)
+                       (for (i 0 dk)
+                         (declare p :uint (+ sb (* i dv)))
+                         (declare sv :float (+ (aref S p) (* (aref K (+ qb i)) d)))
+                         (store (aref S p) sv)
+                         (set o (+ o (* sv (aref Q (+ qb i))))))
+                       (store (aref OUT vb) o)))))
+      nelisp-gpu-kernels)
+
 ;; Ternary weights: sixteen two-bit fields per word, one scale per 128 columns.
 ;;
 ;; No DP4A here, and that is the point rather than an omission.  The weight is
