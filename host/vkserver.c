@@ -109,17 +109,99 @@ static uint32_t mtype(uint32_t bits, VkMemoryPropertyFlags w){
   fprintf(stderr,"vkserver: no mem type\n"); exit(2);
 }
 
-static void make_buffer(uint32_t nfloats, VkBuffer *buf, VkDeviceMemory *mem){
+/* Every buffer used to be HOST_VISIBLE|HOST_COHERENT, which on a discrete
+ * card without resizable BAR means system RAM: the shader then fetched each
+ * weight word across PCIe, and because adjacent threads walk rows WNG words
+ * apart, a warp's 32 reads were 32 separate transactions.  Measured on a GTX
+ * 1060 that is ~0.9 GMAC/s against 4.4 TFLOPS of hardware.  Resident weights
+ * are written once and read by every dispatch, so they belong in DEVICE_LOCAL
+ * memory, reached through a staging copy. */
+static int mtype_opt(uint32_t bits, VkMemoryPropertyFlags w){
+  VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd,&mp);
+  for(uint32_t i=0;i<mp.memoryTypeCount;i++)
+    if((bits&(1u<<i))&&(mp.memoryTypes[i].propertyFlags&w)==w) return (int)i;
+  return -1;
+}
+
+static void make_buffer_ex(uint32_t nfloats, VkBuffer *buf, VkDeviceMemory *mem,
+                           int device_local){
   VkDeviceSize bs=(VkDeviceSize)nfloats*4; if(bs==0)bs=4;
   VkBufferCreateInfo bi={VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size=bs;
-  bi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  bi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT
+          |VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
   bi.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
   VK_CHECK(vkCreateBuffer(dev,&bi,NULL,buf));
   VkMemoryRequirements r; vkGetBufferMemoryRequirements(dev,*buf,&r);
   VkMemoryAllocateInfo ai={VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize=r.size;
-  ai.memoryTypeIndex=mtype(r.memoryTypeBits,
+  int ti=-1;
+  if(device_local) ti=mtype_opt(r.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if(ti<0) ti=(int)mtype(r.memoryTypeBits,
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-  VK_CHECK(vkAllocateMemory(dev,&ai,NULL,mem)); VK_CHECK(vkBindBufferMemory(dev,*buf,*mem,0));
+  ai.memoryTypeIndex=(uint32_t)ti;
+  if(vkAllocateMemory(dev,&ai,NULL,mem)!=VK_SUCCESS){
+    /* Out of VRAM: fall back to host memory rather than killing the server,
+     * so a model too large for the card still runs, only slowly. */
+    ai.memoryTypeIndex=mtype(r.memoryTypeBits,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(dev,&ai,NULL,mem));
+  }
+  VK_CHECK(vkBindBufferMemory(dev,*buf,*mem,0));
+}
+
+static void make_buffer(uint32_t nfloats, VkBuffer *buf, VkDeviceMemory *mem){
+  make_buffer_ex(nfloats,buf,mem,0);
+}
+
+/* Is MEM one the host can map?  A DEVICE_LOCAL allocation on this card is
+ * not, so the caller has to stage; a fallback allocation is, and staging it
+ * would only add a copy. */
+static int host_mappable(VkBuffer buf, VkDeviceMemory mem){
+  (void)mem; VkMemoryRequirements r; vkGetBufferMemoryRequirements(dev,buf,&r);
+  return mtype_opt(r.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)<0;
+}
+
+#define STAGE_FLOATS (16u*1024u*1024u)   /* 64 MiB of staging at a time */
+
+/* Copy NFLOATS into DST.  Exactly one of DATA and F supplies the bytes; F is
+ * read chunk by chunk so a 300 MB projection never needs 300 MB of staging.
+ * Returns 0 on success, and the number of floats NOT transferred on a short
+ * read, which is what the file path has to report. */
+static uint32_t staged_write(VkBuffer dst, uint32_t nfloats,
+                             const void *data, FILE *f){
+  if(nfloats==0) return 0;
+  uint32_t chunk=nfloats<STAGE_FLOATS?nfloats:STAGE_FLOATS;
+  VkBuffer sb; VkDeviceMemory sm;
+  make_buffer_ex(chunk,&sb,&sm,0);
+  VkCommandBufferAllocateInfo ba={VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ba.commandPool=cmdpool; ba.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ba.commandBufferCount=1;
+  VkCommandBuffer cb; VK_CHECK(vkAllocateCommandBuffers(dev,&ba,&cb));
+  uint32_t done=0, missing=0;
+  while(done<nfloats){
+    uint32_t n=nfloats-done; if(n>chunk) n=chunk;
+    void *p; VK_CHECK(vkMapMemory(dev,sm,0,(VkDeviceSize)n*4,0,&p));
+    if(f){
+      size_t want=(size_t)n*4, got=fread(p,1,want,f);
+      if(got!=want){ memset((char*)p+got,0,want-got); missing=(uint32_t)((want-got)/4); }
+    } else {
+      memcpy(p,(const char*)data+(size_t)done*4,(size_t)n*4);
+    }
+    vkUnmapMemory(dev,sm);
+    VkCommandBufferBeginInfo bg={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bg.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cb,&bg));
+    VkBufferCopy bc={0,(VkDeviceSize)done*4,(VkDeviceSize)n*4};
+    vkCmdCopyBuffer(cb,sb,dst,1,&bc);
+    VK_CHECK(vkEndCommandBuffer(cb));
+    VkSubmitInfo si={VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&cb;
+    VK_CHECK(vkQueueSubmit(queue,1,&si,VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(queue));
+    VK_CHECK(vkResetCommandBuffer(cb,0));
+    done+=n;
+    if(missing) break;
+  }
+  vkFreeCommandBuffers(dev,cmdpool,1,&cb);
+  vkDestroyBuffer(dev,sb,NULL); vkFreeMemory(dev,sm,NULL);
+  return missing;
 }
 
 static void write_buffer(VkDeviceMemory mem, uint32_t nfloats, const void *data){
@@ -261,8 +343,10 @@ static void handle_upload(void){
     if(nres>=MAXRES){ fprintf(stderr,"vkserver: resident table full\n"); free(data); wr_u32(1); wr_u32(0); fflush(stdout); return; }
     h=nres++;
   }
-  make_buffer(n,&res[h].buf,&res[h].mem); res[h].size=n; res[h].used=1;
-  write_buffer(res[h].mem,n,data); free(data);
+  make_buffer_ex(n,&res[h].buf,&res[h].mem,1); res[h].size=n; res[h].used=1;
+  if(host_mappable(res[h].buf,res[h].mem)) write_buffer(res[h].mem,n,data);
+  else staged_write(res[h].buf,n,data,NULL);
+  free(data);
   wr_u32(0); wr_u32((uint32_t)h); fflush(stdout);
 }
 
@@ -273,7 +357,11 @@ static void handle_write_resident(void){
   uint32_t h, n; if(!rd_u32(&h)) exit(0); if(!rd_u32(&n)) exit(0);
   float *data=malloc((n?n:1)*4);
   if(n && fread(data,4,n,stdin)!=n){ free(data); exit(0); }
-  if(h<MAXRES && res[h].used){ write_buffer(res[h].mem,n,data); wr_u32(0); }
+  if(h<MAXRES && res[h].used){
+    if(host_mappable(res[h].buf,res[h].mem)) write_buffer(res[h].mem,n,data);
+    else staged_write(res[h].buf,n,data,NULL);
+    wr_u32(0);
+  }
   else { fprintf(stderr,"vkserver: write bad resident %u\n",h); wr_u32(1); }
   free(data); fflush(stdout);
 }
@@ -300,13 +388,19 @@ static void handle_upload_file(void){
     if(nres>=MAXRES){ fprintf(stderr,"vkserver: resident table full\n"); fclose(f); wr_u32(1); wr_u32(0); fflush(stdout); return; }
     h=nres++;
   }
-  make_buffer(n,&res[h].buf,&res[h].mem); res[h].size=n; res[h].used=1;
+  make_buffer_ex(n,&res[h].buf,&res[h].mem,1); res[h].size=n; res[h].used=1;
   if(n){
-    void *p; VK_CHECK(vkMapMemory(dev,res[h].mem,0,(VkDeviceSize)n*4,0,&p));
-    size_t want=(size_t)n*4, got=fread(p,1,want,f);
-    vkUnmapMemory(dev,res[h].mem);
-    if(got!=want){
-      fprintf(stderr,"vkserver: %s short read %zu of %zu\n",path,got,want);
+    uint32_t missing;
+    if(host_mappable(res[h].buf,res[h].mem)){
+      void *p; VK_CHECK(vkMapMemory(dev,res[h].mem,0,(VkDeviceSize)n*4,0,&p));
+      size_t want=(size_t)n*4, got=fread(p,1,want,f);
+      vkUnmapMemory(dev,res[h].mem);
+      missing=(uint32_t)((want-got)/4);
+    } else {
+      missing=staged_write(res[h].buf,n,NULL,f);
+    }
+    if(missing){
+      fprintf(stderr,"vkserver: %s short read, %u floats missing\n",path,missing);
       vkDestroyBuffer(dev,res[h].buf,NULL); vkFreeMemory(dev,res[h].mem,NULL);
       res[h].used=0; fclose(f); wr_u32(1); wr_u32(0); fflush(stdout); return;
     }
